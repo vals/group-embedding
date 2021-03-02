@@ -7,7 +7,6 @@ from rich.logging import RichHandler
 from scvi.data import setup_anndata
 
 from ._mymodel import MyModel, MyModule
-from ._mypyromodel import MyPyroModel, MyPyroModule
 
 # https://github.com/python-poetry/poetry/pull/2366#issuecomment-652418094
 # https://github.com/python-poetry/poetry/issues/144#issuecomment-623927302

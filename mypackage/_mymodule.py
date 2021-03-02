@@ -1,18 +1,54 @@
+from typing import Iterable
+
 import numpy as np
 import torch
+from torch.distributions.bernoulli import Bernoulli
 from scvi import _CONSTANTS
-from scvi.compose import (
-    BaseModuleClass,
-    DecoderSCVI,
+from scvi.module.base import BaseModuleClass, LossRecorder, auto_move_data
+from scvi.nn import (
     Encoder,
-    LossRecorder,
-    auto_move_data,
+    FCLayers
 )
 from scvi.distributions import ZeroInflatedNegativeBinomial
 from torch.distributions import Normal
 from torch.distributions import kl_divergence as kl
 
 torch.backends.cudnn.benchmark = True
+
+
+class BinaryDecoder(torch.nn.Module):
+    """ 
+    Decodes data from latent space to logit space
+    """
+    def __init__(
+        self,
+        n_input: int,
+        n_output: int,
+        n_cat_list: Iterable[int] = None,
+        n_layers: int = 1,
+        n_hidden: int = 128,
+        **kwargs,
+    ):
+        super().__init__()
+        self.decoder = FCLayers(
+            n_in=n_input,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=0,
+            **kwargs,
+        )
+    
+        self.logit_decoder = torch.nn.Linear(n_hidden, n_output)
+    
+    def forward(self, x: torch.Tensor, *cat_list: int):
+        """
+        """
+        # Parameters for latent distribution
+        p = self.decoder(x, *cat_list)
+        p_logit = self.logit_decoder(p)
+        return p_logit
 
 
 class MyModule(BaseModuleClass):
@@ -54,7 +90,7 @@ class MyModule(BaseModuleClass):
         self.latent_distribution = "normal"
 
         # setup the parameters of your generative model, as well as your inference model
-        self.px_r = torch.nn.Parameter(torch.randn(n_input))
+
         # z encoder goes from the n_input-dimensional data to an n_latent-d
         # latent space representation
         self.z_encoder = Encoder(
@@ -64,16 +100,8 @@ class MyModule(BaseModuleClass):
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
         )
-        # l encoder goes from n_input-dimensional data to 1-d library size
-        self.l_encoder = Encoder(
-            n_input,
-            1,
-            n_layers=1,
-            n_hidden=n_hidden,
-            dropout_rate=dropout_rate,
-        )
         # decoder goes from n_latent-dimensional space to n_input-d data
-        self.decoder = DecoderSCVI(
+        self.decoder = BinaryDecoder(
             n_latent,
             n_input,
             n_layers=n_layers,
@@ -89,11 +117,9 @@ class MyModule(BaseModuleClass):
 
     def _get_generative_input(self, tensors, inference_outputs):
         z = inference_outputs["z"]
-        library = inference_outputs["library"]
 
         input_dict = {
-            "z": z,
-            "library": library,
+            "z": z
         }
         return input_dict
 
@@ -108,21 +134,19 @@ class MyModule(BaseModuleClass):
         x_ = torch.log(1 + x)
         # get variational parameters via the encoder networks
         qz_m, qz_v, z = self.z_encoder(x_)
-        ql_m, ql_v, library = self.l_encoder(x_)
 
-        outputs = dict(z=z, qz_m=qz_m, qz_v=qz_v, ql_m=ql_m, ql_v=ql_v, library=library)
+        outputs = dict(z=z, qz_m=qz_m, qz_v=qz_v)
         return outputs
 
     @auto_move_data
-    def generative(self, z, library):
+    def generative(self, z):
         """Runs the generative model."""
 
-        # form the parameters of the ZINB likelihood
-        px_scale, _, px_rate, px_dropout = self.decoder("gene", z, library)
-        px_r = torch.exp(self.px_r)
+        # form the parameters of the Bernoulli likelihood
+        px_logit = self.decoder(z)
 
         return dict(
-            px_scale=px_scale, px_r=px_r, px_rate=px_rate, px_dropout=px_dropout
+            px_logit=px_logit
         )
 
     def loss(
@@ -130,19 +154,12 @@ class MyModule(BaseModuleClass):
         tensors,
         inference_outputs,
         generative_outputs,
-        kl_weight: float = 1.0,
     ):
         x = tensors[_CONSTANTS.X_KEY]
-        local_l_mean = tensors[_CONSTANTS.LOCAL_L_MEAN_KEY]
-        local_l_var = tensors[_CONSTANTS.LOCAL_L_VAR_KEY]
 
         qz_m = inference_outputs["qz_m"]
         qz_v = inference_outputs["qz_v"]
-        ql_m = inference_outputs["ql_m"]
-        ql_v = inference_outputs["ql_v"]
-        px_rate = generative_outputs["px_rate"]
-        px_r = generative_outputs["px_r"]
-        px_dropout = generative_outputs["px_dropout"]
+        px_logit = generative_outputs["px_logit"]
 
         mean = torch.zeros_like(qz_m)
         scale = torch.ones_like(qz_v)
@@ -151,26 +168,16 @@ class MyModule(BaseModuleClass):
             dim=1
         )
 
-        kl_divergence_l = kl(
-            Normal(ql_m, torch.sqrt(ql_v)),
-            Normal(local_l_mean, torch.sqrt(local_l_var)),
-        ).sum(dim=1)
-
         reconst_loss = (
-            -ZeroInflatedNegativeBinomial(mu=px_rate, theta=px_r, zi_logits=px_dropout)
+            -Bernoulli(logits=px_logit)
             .log_prob(x)
             .sum(dim=-1)
         )
 
-        kl_local_for_warmup = kl_divergence_l
-        kl_local_no_warmup = kl_divergence_z
-
-        weighted_kl_local = kl_weight * kl_local_for_warmup + kl_local_no_warmup
-
-        loss = torch.mean(reconst_loss + weighted_kl_local)
+        loss = torch.mean(reconst_loss + kl_divergence_z)
 
         kl_local = dict(
-            kl_divergence_l=kl_divergence_l, kl_divergence_z=kl_divergence_z
+            kl_divergence_z=kl_divergence_z
         )
         kl_global = 0.0
         return LossRecorder(loss, reconst_loss, kl_local, kl_global)
